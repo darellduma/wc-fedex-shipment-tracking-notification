@@ -30,6 +30,9 @@
 
     if( ! class_exists( 'WCFedExShipmentTrackingNotification') ){
         class WCFedExShipmentTrackingNotification{
+            private $fedex_api_base_url;
+            private $tracking_error_messages = [];
+
             public function __construct() {
                 $this->load_env();
             }
@@ -47,7 +50,7 @@
                 $default_env = <<<ENV
                 FEDEX_API_KEY=
                 FEDEX_SECRET_KEY=
-                FEDEX_API_BASE_URL=https://apis.fedex.com/
+                FEDEX_API_ENVIRONMENT=production
                 ENV;
 
                 // Try to write the .env file
@@ -91,10 +94,12 @@
 
                     $api_key_input_value = sanitize_text_field( trim( $_POST[ 'fedex_api_key' ] ) );
                     $secret_key_input_value = sanitize_text_field( trim( $_POST[ 'fedex_secret_key' ] ) );
+                    $api_environment_input_value = sanitize_text_field( trim( $_POST[ 'fedex_api_environment' ] ) );
 
                     if( ! $has_errors ){
                         $this->update_env_value('FEDEX_API_KEY', $api_key_input_value );
                         $this->update_env_value('FEDEX_SECRET_KEY', $secret_key_input_value );
+                        $this->update_env_value('FEDEX_API_ENVIRONMENT', $api_environment_input_value );
                         ?>
                             <div class="notice notice-success">
                                 <p>Settings Updated</p>
@@ -112,11 +117,22 @@
                     'secret_key'    => !empty( $secret_key_input_value ) ? $secret_key_input_value : $fedex_api_keys[ 'secret_key' ] ?? "",
                 ];
 
+                $api_environment = ! empty( $api_environment_input_value ) ? $api_environment_input_value : esc_attr( $_ENV[ 'FEDEX_API_ENVIRONMENT' ] ) ?? "production" ;
+
                 ?>
                 
                     <form method="post" action="<?php echo sprintf( '%s&_wpnonce=%s', menu_page_url( 'fedex-api-keys', false), wp_create_nonce( 'fedex-api-keys-save' ) ); ?>" class="fedex-api-keys-form" >
                         <h2>FedEx API Keys</h2>
                         <table class="form-table" role="presentation">
+                            <tr>
+                                <th scope="row"><label for="fedex_api_environment">API Environment</label></th>
+                                <td>
+                                    <select name="fedex_api_environment" id="fedex_api_environment">
+                                        <option value="test" <?php selected( $api_environment, 'test' ) ?>>Test</option>
+                                        <option value="production" <?php selected( $api_environment, 'production' ) ?>>Production</option>
+                                    </select>
+                                </td>
+                            </tr>
                             <tr>
                                 <th scope="row"><label for="fedex_api_key">Public Key</label></th>
                                 <td><input class="regular-text" id="fedex_api_key" name="fedex_api_key" type="text" value="<?php echo esc_attr( $api_keys[ 'api_key' ] ?? "" ); ?>"  /></td>
@@ -137,9 +153,15 @@
                 if ( file_exists( $plugin_root . '/.env' ) ) {
                     $dotenv = Dotenv::createImmutable( $plugin_root );
                     $dotenv->safeLoad(); // Use load() if you want to enforce required keys
+                    $api_environment = sanitize_text_field( trim( $_ENV[ 'FEDEX_API_ENVIRONMENT' ] ) );
+                    $this->fedex_api_base_url = $this->load_fedex_api_base_url( $api_environment );
                 } else {
                     error_log(".env file does not exist in $plugin_root /.env");
                 }
+            }
+
+            private function load_fedex_api_base_url( $api_environment ){
+                return $api_environment === 'production' ? 'https://apis.fedex.com/' : 'https://apis-sandbox.fedex.com/';
             }
 
             function mv_add_other_fields_for_packaging(){
@@ -193,8 +215,12 @@
                     $tracking_number = sanitize_text_field( $_POST[ 'tracking-number' ] );
                     $exising_tracking_number = get_post_meta( $post_id, 'tracking_number', true );
                     if( $exising_tracking_number === $tracking_number ) return;
-                    update_post_meta( $post_id, 'tracking_number', $tracking_number );
-                    $this->send_notifications( $post_id, $tracking_number );
+                    $send_notification_response = $this->send_notification_success( $post_id, $tracking_number );
+                    if($send_notification_response){
+                        update_post_meta( $post_id, 'tracking_number', $tracking_number );
+                    } else {
+                        delete_post_meta( $post_id, 'tracking_number' );
+                    }
                 }
             }
 
@@ -207,7 +233,7 @@
                 flush_rewrite_rules();
             } //end function on_deactivation
 
-            function send_notifications( $order_id, $tracking_number ){
+            function send_notification_success( $order_id, $tracking_number ){
                 $token_request = $this->token_request();
 
                 $order = wc_get_order( $order_id );
@@ -240,7 +266,7 @@
                 $curl = curl_init();
 
                 curl_setopt_array($curl, array(
-                CURLOPT_URL => $_ENV[ 'FEDEX_API_BASE_URL' ] . 'track/v1/notifications',
+                CURLOPT_URL => $this->fedex_api_base_url . 'track/v1/notifications',
                 CURLOPT_RETURNTRANSFER => true,
                 CURLOPT_ENCODING => '',
                 CURLOPT_MAXREDIRS => 10,
@@ -255,23 +281,62 @@
                 ),
                 ));
 
-                $response = curl_exec($curl);
+                $response = curl_exec( $curl );
+
+                // Get HTTP response status code
+                $httpCode = curl_getinfo( $curl, CURLINFO_HTTP_CODE );
+                $decoded_response = json_decode( $response, true );
+                $messages = [];
+
+                if( $httpCode !== 200 ){
+                    if (is_null($decoded_response)) {
+                        error_log( 'JSON decode error: ' . json_last_error_msg() );
+                    } else {
+                        foreach( $decoded_response[ 'errors' ] as $d ){
+                            array_push( $messages, $d[ 'message' ] );
+                        }
+                    }
+                    // Store messages in a transient tied to the order ID
+                    set_transient('tracking_error_' . $order_id, $messages, 60); // expires in 1 minute
+
+                    add_filter( 'redirect_post_location', [ $this, 'update_notices' ], 10, 1 );
+                    curl_close($curl);
+                    return false;
+                }
+
+                if (curl_errno($curl)) {
+                    add_filter( 'redirect_post_location', [ $this, 'update_notices' ], 10, 1 );
+                    error_log( 'cURL Error (' . curl_errno( $curl ) . '): ' . curl_error( $curl ) );
+                    curl_close($curl);
+                    return false;
+                }
 
                 curl_close($curl);
-                echo $response;
+                return true;
 
-            } //send_notifications
+            } //send_notification_success
 
             function settings_submenu(){
-                add_submenu_page(
-                    'options-general.php',
+                add_options_page(
                     'FedEx API Keys',
                     'FedEx API Keys',
-                    'administrator',
+                    'manage_options',
                     'fedex-api-keys',
                     [ $this, 'fedex_api_keys_settings_page' ],
                     99
                 );
+            }
+
+            function show_notices( $location ){
+                if (isset($_GET['tracking_error'])) {
+                    $order_id = absint( $_GET['tracking_error'] );
+                    $messages = get_transient( 'tracking_error_' . $order_id );
+                    foreach ( $messages as $msg ) {
+                        echo '<div class="notice notice-error"><p><strong>' . esc_html($msg) . '</strong></p></div>';
+                    }
+
+                    delete_transient('tracking_error_' . $order_id);
+                }
             }
 
             function token_request(){
@@ -281,7 +346,7 @@
                 $curl = curl_init();
         
                 curl_setopt_array($curl, array(
-                    CURLOPT_URL => $_ENV[ 'FEDEX_API_BASE_URL' ] . 'oauth/token',
+                    CURLOPT_URL => $this->fedex_api_base_url . 'oauth/token',
                     CURLOPT_RETURNTRANSFER => true,
                     CURLOPT_ENCODING => '',
                     CURLOPT_MAXREDIRS => 10,
@@ -295,11 +360,19 @@
                     ),
                 ));
         
-                $response = json_decode( curl_exec( $curl ), true );
+                $response = curl_exec( $curl );
+                    
+                if (curl_errno($curl)) {
+                    add_action('admin_notices', function () {
+                        echo '<div class="notice notice-error"><p><strong>Error sending notifications. Please check the logs.</strong></p></div>';
+                    });
+                    error_log( 'cURL Error (' . curl_errno( $curl ) . '): ' . curl_error( $curl ) );
+                    curl_close($curl);
+                    return;
+                }
 
-
-                return $response;
                 curl_close($curl);
+                return json_decode( $response, true );
         
             } //end function token_request
 
@@ -331,13 +404,31 @@
                 file_put_contents($env_path, implode(PHP_EOL, $lines) . PHP_EOL);
             } //end function update_env_value
 
+            function update_notices( $location ){
+                global $post;
+
+                // Only target shop_order post type
+                if (isset($post) && $post->post_type === 'shop_order') {
+                    // Remove the default 'message=1' (Order updated) if present
+                    $location = remove_query_arg('message', $location);
+
+                    // Add your custom error flag
+                    $location = add_query_arg('tracking_error', $post->ID, $location);
+                }
+
+                return $location;
+            }
+
         }
 
         $plugin = new WCFedExShipmentTrackingNotification();
 
         add_action( 'add_meta_boxes', [ $plugin, 'mv_order_tracking_meta_boxes' ] );
-        add_action( 'init', [ $plugin, 'settings_submenu' ] );
+        add_action( 'admin_menu', [ $plugin, 'settings_submenu' ] );
+        add_action('admin_notices', [ $plugin, 'show_notices' ] );
         add_action( 'save_post', [ $plugin, 'mv_save_wc_order_other_fields' ], 10, 1 );
+
+        // add_filter( 'redirect_post_location', [ $plugin, 'update_notices' ] );
 
         register_activation_hook( __FILE__, [ $plugin, 'on_activation' ] );
     }
